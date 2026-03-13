@@ -1,0 +1,110 @@
+name: Ping Search Engines with Sitemap
+
+on:
+  # Triggers after Vercel deploys via the deployment_status event
+  deployment_status:
+
+env:
+  # REPLACE with your production URL
+  SITE_URL: https://YOURDOMAIN.com
+  SITEMAP_URL: https://YOURDOMAIN.com/sitemap.xml
+
+jobs:
+  ping-sitemap:
+    # Only run when a production deployment succeeds
+    if: >
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment_status.environment == 'Production'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Google
+        run: |
+          echo "Pinging Google..."
+          curl -s -o /dev/null -w "Google ping: HTTP %{http_code}\n" \
+            "https://www.google.com/ping?sitemap=$SITEMAP_URL"
+
+      - name: Ping Bing
+        run: |
+          echo "Pinging Bing..."
+          curl -s -o /dev/null -w "Bing ping: HTTP %{http_code}\n" \
+            "https://www.bing.com/ping?sitemap=$SITEMAP_URL"
+
+      - name: Ping Yandex
+        run: |
+          echo "Pinging Yandex..."
+          curl -s -o /dev/null -w "Yandex ping: HTTP %{http_code}\n" \
+            "https://webmaster.yandex.com/ping?sitemap=$SITEMAP_URL"
+
+      - name: Submit via IndexNow (Bing, Yandex, Seznam, Naver)
+        if: env.INDEXNOW_KEY != ''
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+        run: |
+          echo "Submitting to IndexNow..."
+          curl -s -w "IndexNow: HTTP %{http_code}\n" \
+            -X POST "https://api.indexnow.org/indexnow" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"host\": \"${SITE_URL#https://}\",
+              \"key\": \"$INDEXNOW_KEY\",
+              \"keyLocation\": \"$SITE_URL/$INDEXNOW_KEY.txt\",
+              \"urlList\": [\"$SITEMAP_URL\"]
+            }"
+
+      - name: Submit to Google (Search Console + Indexing API)
+        if: env.GOOGLE_SA_JSON != ''
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+        run: |
+          pip install -q google-auth requests
+
+          python3 - <<'PYEOF'
+          import json, os, sys, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+
+          sa_info = json.loads(os.environ["GOOGLE_SA_JSON"])
+          SITE_URL = os.environ["SITE_URL"]
+          SITEMAP_URL = os.environ["SITEMAP_URL"]
+
+          # Extract domain from SITE_URL
+          domain = SITE_URL.replace("https://", "").replace("http://", "").rstrip("/")
+
+          # --- Search Console API: submit sitemap ---
+          sc_credentials = service_account.Credentials.from_service_account_info(
+              sa_info,
+              scopes=["https://www.googleapis.com/auth/webmasters"],
+          )
+          sc_credentials.refresh(Request())
+
+          site_url = f"sc-domain:{domain}"
+          encoded_site = requests.utils.quote(site_url, safe="")
+          encoded_sitemap = requests.utils.quote(SITEMAP_URL, safe="")
+
+          resp = requests.put(
+              f"https://searchconsole.googleapis.com/webmasters/v3/sites/{encoded_site}/sitemaps/{encoded_sitemap}",
+              headers={"Authorization": f"Bearer {sc_credentials.token}"},
+          )
+          print(f"Search Console submit: HTTP {resp.status_code}")
+          if resp.status_code not in (200, 204):
+              print(resp.text)
+
+          # --- Indexing API: notify URL updated ---
+          idx_credentials = service_account.Credentials.from_service_account_info(
+              sa_info,
+              scopes=["https://www.googleapis.com/auth/indexing"],
+          )
+          idx_credentials.refresh(Request())
+
+          idx_resp = requests.post(
+              "https://indexing.googleapis.com/v3/urlNotifications:publish",
+              headers={
+                  "Authorization": f"Bearer {idx_credentials.token}",
+                  "Content-Type": "application/json",
+              },
+              json={"url": SITEMAP_URL, "type": "URL_UPDATED"},
+          )
+          print(f"Indexing API notify: HTTP {idx_resp.status_code}")
+          if idx_resp.status_code != 200:
+              print(idx_resp.text)
+          PYEOF
